@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, realpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -71,6 +71,22 @@ test("the approval pipeline exposes safe, candidate, and hard-guard behavior", a
 
 test("risk assessments can allow candidates but cannot downgrade Hard Guards", async () => {
   const workspace = await mkdtemp(join(tmpdir(), "sentinel-assessment-"));
+  const lowUi = ui();
+  assert.deepEqual(
+    await approveToolCall(
+      { toolName: "bash", input: { command: "npm --version" } },
+      {
+        workspace,
+        mode: "tui",
+        ui: lowUi.value,
+        assess: async () => ({ riskLevel: "low", operation: "Read npm version", riskExplanation: "No state is changed." }),
+      },
+    ),
+    {},
+  );
+  assert.equal(lowUi.notifications.length, 0);
+  assert.equal(lowUi.prompts.length, 0);
+
   const mediumUi = ui();
   const result = await approveToolCall(
     { toolName: "bash", input: { command: "npm test" } },
@@ -120,4 +136,89 @@ test("Approval choices and assessment failure fail closed", async () => {
     },
   );
   assert.match(failed.reason ?? "", /Risk assessment failed/);
+});
+
+test("the AI Judge receives bounded context and calibrates Candidate Operations", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "sentinel-judge-"));
+  const seen: unknown[] = [];
+  const judge = async (input: Parameters<NonNullable<Parameters<typeof approveToolCall>[1]["assess"]>>[0]) => {
+    seen.push(input);
+    const command = String(input.call.input.command);
+    if (command.includes("node_modules") || command.includes("sudo npm")) {
+      return { riskLevel: "medium" as const, operation: "Run a routine package operation", riskExplanation: "The change is recoverable." };
+    }
+    return { riskLevel: "high" as const, operation: "Delete a user document", riskExplanation: "The file is outside the Workspace." };
+  };
+
+  for (const command of ["rm -rf node_modules", "sudo npm install -g typescript"]) {
+    const candidateUi = ui();
+    assert.deepEqual(
+      await approveToolCall(
+        { toolName: "bash", input: { command } },
+        {
+          workspace,
+          mode: "tui",
+          ui: candidateUi.value,
+          tool: { description: "Run a shell command", parameters: { type: "object" } },
+          userRequest: "Install and maintain this project",
+          assess: judge,
+        },
+      ),
+      {},
+    );
+    assert.equal(candidateUi.notifications.length, 1);
+    assert.equal(candidateUi.prompts.length, 0);
+  }
+
+  const externalUi = ui(["Deny"]);
+  assert.equal(
+    (
+      await approveToolCall(
+        { toolName: "bash", input: { command: "rm -f /Users/example/Documents/report.docx" } },
+        {
+          workspace,
+          mode: "tui",
+          ui: externalUi.value,
+          tool: { description: "Run a shell command", parameters: { type: "object" } },
+          userRequest: "Clean generated files",
+          assess: judge,
+        },
+      )
+    ).block,
+    true,
+  );
+  assert.equal(externalUi.prompts.length, 1);
+  assert.deepEqual(seen[0], {
+    call: { toolName: "bash", input: { command: "rm -rf node_modules" } },
+    tool: { description: "Run a shell command", parameters: { type: "object" } },
+    workspace: await realpath(workspace),
+    userRequest: "Install and maintain this project",
+  });
+});
+
+test("judge cancellation and malformed assessments use the same failure path", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "sentinel-failure-"));
+  for (const assess of [
+    async () => ({ riskLevel: "uncertain", operation: "Unknown", riskExplanation: "Unknown" }),
+    async (_input: unknown, signal: AbortSignal) => {
+      await new Promise((resolve) => signal.addEventListener("abort", resolve, { once: true }));
+      throw signal.reason;
+    },
+  ]) {
+    const controller = new AbortController();
+    if (assess.length > 1) queueMicrotask(() => controller.abort());
+    const failedUi = ui(["Deny"]);
+    const result = await approveToolCall(
+      { toolName: "custom_tool", input: { payload: "data" } },
+      {
+        workspace,
+        mode: "rpc",
+        ui: failedUi.value,
+        signal: controller.signal,
+        assess: assess as NonNullable<Parameters<typeof approveToolCall>[1]["assess"]>,
+      },
+    );
+    assert.equal(result.block, true);
+    assert.match(failedUi.prompts[0], /Risk assessment failed/);
+  }
 });

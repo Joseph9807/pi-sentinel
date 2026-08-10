@@ -1,12 +1,7 @@
-import { classifyToolCall, type PolicyDecision, type ToolCall } from "./policy.ts";
+import { canonicalPath, classifyToolCall, type PolicyDecision, type ToolCall } from "./policy.ts";
+import { type JudgeInput, type RiskAssessment, validateRiskAssessment } from "./judge.ts";
 
-export type RiskLevel = "low" | "medium" | "high";
-
-export interface RiskAssessment {
-  riskLevel: RiskLevel;
-  operation: string;
-  riskExplanation: string;
-}
+export type { RiskAssessment, RiskLevel } from "./judge.ts";
 
 export interface ApprovalUI {
   select(title: string, options: string[]): Promise<string | undefined>;
@@ -18,7 +13,10 @@ export interface PipelineRuntime {
   workspace: string;
   mode: "tui" | "rpc" | "json" | "print";
   ui: ApprovalUI;
-  assess?: (call: ToolCall) => Promise<RiskAssessment>;
+  tool?: JudgeInput["tool"];
+  userRequest?: string;
+  signal?: AbortSignal;
+  assess?: (input: JudgeInput, signal: AbortSignal) => Promise<RiskAssessment>;
 }
 
 export interface ApprovalResult {
@@ -41,7 +39,24 @@ export async function approveToolCall(call: ToolCall, runtime: PipelineRuntime):
   };
   if (policy.route === "candidate" && runtime.assess) {
     try {
-      assessment = await runtime.assess(call);
+      const signal = runtime.signal
+        ? AbortSignal.any([runtime.signal, AbortSignal.timeout(15_000)])
+        : AbortSignal.timeout(15_000);
+      signal.throwIfAborted();
+      assessment = validateRiskAssessment(
+        await withAbort(
+          runtime.assess(
+            {
+              call,
+              tool: runtime.tool ?? { description: "No tool definition is available.", parameters: {} },
+              workspace: await canonicalPath(runtime.workspace),
+              userRequest: runtime.userRequest ?? "No user request is available.",
+            },
+            signal,
+          ),
+          signal,
+        ),
+      );
     } catch {
       assessment.riskExplanation = "Risk assessment failed, so Sentinel requires human Approval.";
     }
@@ -54,6 +69,27 @@ export async function approveToolCall(call: ToolCall, runtime: PipelineRuntime):
   }
 
   return requestApproval(policy, assessment, runtime);
+}
+
+function withAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const abort = () => reject(signal.reason);
+    if (signal.aborted) {
+      reject(signal.reason);
+      return;
+    }
+    signal.addEventListener("abort", abort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", abort);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener("abort", abort);
+        reject(error);
+      },
+    );
+  });
 }
 
 async function requestApproval(
