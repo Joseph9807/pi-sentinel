@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import type { AuditEvent } from "../src/audit.ts";
-import { approveToolCall, type ApprovalUI } from "../src/pipeline.ts";
+import { approveToolCall, type ApprovalQueue, type ApprovalUI } from "../src/pipeline.ts";
 
 function ui(choices: string[] = [], instructions: string[] = []) {
   const prompts: string[] = [];
@@ -199,29 +199,189 @@ test("the AI Judge receives bounded context and calibrates Candidate Operations"
 
 test("judge cancellation and malformed assessments use the same failure path", async () => {
   const workspace = await mkdtemp(join(tmpdir(), "sentinel-failure-"));
-  for (const assess of [
-    async () => ({ riskLevel: "uncertain", operation: "Unknown", riskExplanation: "Unknown" }),
-    async (_input: unknown, signal: AbortSignal) => {
-      await new Promise((resolve) => signal.addEventListener("abort", resolve, { once: true }));
-      throw signal.reason;
+  const failedUi = ui(["Deny"]);
+  const result = await approveToolCall(
+    { toolName: "custom_tool", input: { payload: "data" } },
+    {
+      workspace,
+      mode: "rpc",
+      ui: failedUi.value,
+      assess: async () => ({ riskLevel: "uncertain", operation: "Unknown", riskExplanation: "Unknown" }) as never,
     },
-  ]) {
-    const controller = new AbortController();
-    if (assess.length > 1) queueMicrotask(() => controller.abort());
-    const failedUi = ui(["Deny"]);
-    const result = await approveToolCall(
-      { toolName: "custom_tool", input: { payload: "data" } },
+  );
+  assert.equal(result.block, true);
+  assert.match(failedUi.prompts[0], /Risk assessment failed/);
+
+  const controller = new AbortController();
+  const waiting = approveToolCall(
+    { toolName: "custom_tool", input: { payload: "data" } },
+    {
+      workspace,
+      mode: "rpc",
+      ui: ui().value,
+      signal: controller.signal,
+      assess: async (_input, signal) => new Promise((_resolve, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true })),
+    },
+  );
+  controller.abort();
+  await assert.rejects(waiting, { name: "AbortError" });
+});
+
+test("session-local decisions cache identical low and medium assessments and audit every execution", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "sentinel-cache-"));
+  const decisionCache = new Map();
+  const events: AuditEvent[] = [];
+  let assessments = 0;
+  const runtime = {
+    workspace,
+    mode: "tui" as const,
+    ui: ui().value,
+    decisionCache,
+    audit: async (event: AuditEvent) => { events.push(event); },
+    assess: async () => {
+      assessments++;
+      return { riskLevel: "medium" as const, operation: "Run task", riskExplanation: "The change is recoverable." };
+    },
+  };
+
+  await Promise.all([
+    approveToolCall({ toolName: "custom_tool", input: { nested: { b: 2, a: 1 } } }, runtime),
+    approveToolCall({ toolName: "custom_tool", input: { nested: { a: 1, b: 2 } } }, runtime),
+  ]);
+
+  assert.equal(assessments, 1);
+  assert.deepEqual(events.map(({ decisionSource, outcome }) => ({ decisionSource, outcome })), [
+    { decisionSource: "ai-judge", outcome: "allowed" },
+    { decisionSource: "cache", outcome: "allowed" },
+  ]);
+
+  const lowRuntime = {
+    ...runtime,
+    decisionCache: new Map(),
+    assess: async () => {
+      assessments++;
+      return { riskLevel: "low" as const, operation: "Read state", riskExplanation: "No state changes." };
+    },
+  };
+  await Promise.all([
+    approveToolCall({ toolName: "custom_tool", input: { risk: "low" } }, lowRuntime),
+    approveToolCall({ toolName: "custom_tool", input: { risk: "low" } }, lowRuntime),
+  ]);
+  assert.equal(assessments, 2);
+  assert.deepEqual(events.slice(2).map(({ decisionSource, outcome }) => ({ decisionSource, outcome })), [
+    { decisionSource: "ai-judge", outcome: "allowed" },
+    { decisionSource: "cache", outcome: "allowed" },
+  ]);
+
+  await approveToolCall({ toolName: "custom_tool", input: { nested: { a: 1, b: 2 } } }, { ...runtime, decisionCache: new Map() });
+  assert.equal(assessments, 3);
+});
+
+test("high-risk and Hard Guard calls never reuse decisions", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "sentinel-no-cache-"));
+  const decisionCache = new Map();
+  let assessments = 0;
+  const highUi = ui(["Allow once", "Allow once"]);
+  await Promise.all(
+    Array.from({ length: 2 }, () => approveToolCall(
+      { toolName: "custom_tool", input: { action: "publish" } },
       {
         workspace,
-        mode: "rpc",
-        ui: failedUi.value,
-        signal: controller.signal,
-        assess: assess as NonNullable<Parameters<typeof approveToolCall>[1]["assess"]>,
+        mode: "tui",
+        ui: highUi.value,
+        decisionCache,
+        assess: async () => {
+          assessments++;
+          return { riskLevel: "high", operation: "Publish data", riskExplanation: "This changes external state." };
+        },
       },
+    )),
+  );
+  assert.equal(assessments, 2);
+  assert.equal(highUi.prompts.length, 2);
+
+  const hardUi = ui(["Allow once", "Allow once"]);
+  for (let count = 0; count < 2; count++) {
+    await approveToolCall(
+      { toolName: "bash", input: { command: "git reset --hard" } },
+      { workspace, mode: "tui", ui: hardUi.value, decisionCache },
     );
-    assert.equal(result.block, true);
-    assert.match(failedUi.prompts[0], /Risk assessment failed/);
   }
+  assert.equal(hardUi.prompts.length, 2);
+});
+
+test("independent judge calls overlap", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "sentinel-parallel-"));
+  let started = 0;
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const assess = async () => {
+    started++;
+    if (started === 2) release();
+    await gate;
+    return { riskLevel: "low" as const, operation: "Read state", riskExplanation: "No state changes." };
+  };
+
+  await Promise.all([
+    approveToolCall({ toolName: "first_tool", input: {} }, { workspace, mode: "tui", ui: ui().value, assess }),
+    approveToolCall({ toolName: "second_tool", input: {} }, { workspace, mode: "tui", ui: ui().value, assess }),
+  ]);
+  assert.equal(started, 2);
+});
+
+test("human approval dialogs are serialized and cancellation, failure, and abort release the queue", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "sentinel-approval-queue-"));
+  const approvalQueue: ApprovalQueue = { tail: Promise.resolve() };
+  let active = 0;
+  let maximumActive = 0;
+  let releaseFirst!: () => void;
+  const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+  let calls = 0;
+  const approvalUi: ApprovalUI = {
+    async select() {
+      const invocation = ++calls;
+      active++;
+      maximumActive = Math.max(maximumActive, active);
+      try {
+        if (invocation === 1) await firstGate;
+        if (invocation === 2) throw new Error("dialog failed");
+        return invocation === 1 || invocation === 3 ? undefined : "Allow once";
+      } finally {
+        active--;
+      }
+    },
+    async input() { return undefined; },
+    notify() {},
+  };
+  const call = (signal?: AbortSignal) => approveToolCall(
+    { toolName: "custom_tool", input: { call: calls } },
+    {
+      workspace,
+      mode: "tui",
+      ui: approvalUi,
+      signal,
+      approvalQueue,
+      assess: async () => ({ riskLevel: "high", operation: "Change state", riskExplanation: "Approval is required." }),
+    },
+  );
+
+  const first = call();
+  await new Promise((resolve) => setImmediate(resolve));
+  const second = call();
+  const secondFailed = assert.rejects(second, /dialog failed/);
+  await new Promise((resolve) => setImmediate(resolve));
+  const controller = new AbortController();
+  const aborted = call(controller.signal);
+  const abortHandled = assert.rejects(aborted, { name: "AbortError" });
+  controller.abort();
+  releaseFirst();
+
+  assert.equal((await first).block, true);
+  await secondFailed;
+  await abortHandled;
+  assert.equal((await call()).block, true);
+  assert.deepEqual(await call(), {});
+  assert.equal(maximumActive, 1);
 });
 
 test("the pipeline audits meaningful decisions but not Safe Bypasses", async () => {

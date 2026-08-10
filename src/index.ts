@@ -1,9 +1,12 @@
 import { getAgentDir, type ExtensionAPI, type ExtensionContext, type ToolInfo } from "@earendil-works/pi-coding-agent";
 import { writeAuditEvent } from "./audit.ts";
-import { assessWithPi } from "./judge.ts";
-import { approveToolCall } from "./pipeline.ts";
+import { assessWithPi, type RiskAssessment } from "./judge.ts";
+import { approveToolCall, type ApprovalQueue } from "./pipeline.ts";
 
 export default function sentinel(pi: ExtensionAPI): void {
+  const decisionCache = new Map<string, Promise<RiskAssessment>>();
+  const approvalQueue: ApprovalQueue = { tail: Promise.resolve() };
+  pi.on("session_start", () => { decisionCache.clear(); });
   pi.on("tool_call", async (event, ctx) => {
     const tool = pi.getAllTools().find((candidate) => candidate.name === event.toolName);
     const result = await approveToolCall(
@@ -18,6 +21,8 @@ export default function sentinel(pi: ExtensionAPI): void {
         assess: (input, signal) => assessWithPi(input, signal, ctx),
         audit: (auditEvent) => writeAuditEvent(auditEvent, getAgentDir()),
         modelIdentifier: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined,
+        decisionCache,
+        approvalQueue,
       },
     );
     return result.block ? result : undefined;

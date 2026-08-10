@@ -17,7 +17,7 @@ export interface AuditEvent {
   riskLevel: RiskLevel;
   operationSummary: string;
   riskExplanation: string;
-  decisionSource: "ai-judge" | "hard-guard" | "human" | "runtime";
+  decisionSource: "ai-judge" | "cache" | "hard-guard" | "human" | "runtime";
   outcome: "allowed" | "approval-required" | "denied" | "timeout" | "judge-error";
   modelIdentifier: string;
   judgeLatencyMs?: number;
