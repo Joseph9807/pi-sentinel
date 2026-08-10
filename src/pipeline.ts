@@ -1,5 +1,6 @@
 import { canonicalPath, classifyToolCall, type PolicyDecision, type ToolCall } from "./policy.ts";
 import { type JudgeInput, type RiskAssessment, validateRiskAssessment } from "./judge.ts";
+import type { AuditEvent } from "./audit.ts";
 
 export type { RiskAssessment, RiskLevel } from "./judge.ts";
 
@@ -17,6 +18,8 @@ export interface PipelineRuntime {
   userRequest?: string;
   signal?: AbortSignal;
   assess?: (input: JudgeInput, signal: AbortSignal) => Promise<RiskAssessment>;
+  audit?: (event: AuditEvent) => Promise<void>;
+  modelIdentifier?: string;
 }
 
 export interface ApprovalResult {
@@ -32,12 +35,16 @@ export async function approveToolCall(call: ToolCall, runtime: PipelineRuntime):
   const policy = await classifyToolCall(call, runtime.workspace);
   if (policy.route === "safe-bypass") return {};
 
+  const workingDirectory = await canonicalPath(runtime.workspace);
   let assessment: RiskAssessment = {
     riskLevel: "high",
     operation: policy.operation,
     riskExplanation: policy.riskExplanation,
   };
+  let judgeLatencyMs: number | undefined;
+  let judgeOutcome: AuditEvent["outcome"] | undefined;
   if (policy.route === "candidate" && runtime.assess) {
+    const started = performance.now();
     try {
       const signal = runtime.signal
         ? AbortSignal.any([runtime.signal, AbortSignal.timeout(15_000)])
@@ -49,7 +56,7 @@ export async function approveToolCall(call: ToolCall, runtime: PipelineRuntime):
             {
               call,
               tool: runtime.tool ?? { description: "No tool definition is available.", parameters: {} },
-              workspace: await canonicalPath(runtime.workspace),
+              workspace: workingDirectory,
               userRequest: runtime.userRequest ?? "No user request is available.",
             },
             signal,
@@ -57,18 +64,52 @@ export async function approveToolCall(call: ToolCall, runtime: PipelineRuntime):
           signal,
         ),
       );
-    } catch {
+      judgeOutcome = assessment.riskLevel === "high" ? "approval-required" : "allowed";
+    } catch (error) {
+      judgeOutcome = error instanceof DOMException && error.name === "TimeoutError" ? "timeout" : "judge-error";
       assessment.riskExplanation = "Risk assessment failed, so Sentinel requires human Approval.";
+    } finally {
+      judgeLatencyMs = Math.round(performance.now() - started);
     }
+  } else if (policy.route === "candidate") {
+    judgeOutcome = "judge-error";
+    assessment.riskExplanation = "Risk assessment failed, so Sentinel requires human Approval.";
   }
 
-  if (policy.route !== "hard-guard" && assessment.riskLevel === "low") return {};
+  const event = (decisionSource: AuditEvent["decisionSource"], outcome: AuditEvent["outcome"]): AuditEvent => ({
+    timestamp: new Date().toISOString(),
+    workingDirectory,
+    toolName: call.toolName,
+    arguments: call.input,
+    riskLevel: assessment.riskLevel,
+    operationSummary: assessment.operation,
+    riskExplanation: assessment.riskExplanation,
+    decisionSource,
+    outcome,
+    modelIdentifier: runtime.modelIdentifier ?? "unavailable",
+    ...(judgeLatencyMs === undefined ? {} : { judgeLatencyMs }),
+  });
+
+  await audit(runtime, event(policy.route === "hard-guard" ? "hard-guard" : "ai-judge", policy.route === "hard-guard" ? "approval-required" : judgeOutcome!));
+
+  if (policy.route !== "hard-guard" && assessment.riskLevel === "low" && judgeOutcome === "allowed") return {};
   if (policy.route !== "hard-guard" && assessment.riskLevel === "medium") {
     runtime.ui.notify(`Sentinel: ${assessment.operation} (${assessment.riskExplanation})`, "warning");
     return {};
   }
 
-  return requestApproval(policy, assessment, runtime);
+  const result = await requestApproval(policy, assessment, runtime);
+  await audit(runtime, event(runtime.mode === "print" || runtime.mode === "json" ? "runtime" : "human", result.block ? "denied" : "allowed"));
+  return result;
+}
+
+async function audit(runtime: PipelineRuntime, event: AuditEvent): Promise<void> {
+  if (!runtime.audit) return;
+  try {
+    await runtime.audit(event);
+  } catch {
+    if (runtime.mode === "tui" || runtime.mode === "rpc") runtime.ui.notify("Sentinel could not write the audit trail.", "error");
+  }
 }
 
 function withAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {

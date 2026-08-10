@@ -3,6 +3,7 @@ import { mkdtemp, realpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import type { AuditEvent } from "../src/audit.ts";
 import { approveToolCall, type ApprovalUI } from "../src/pipeline.ts";
 
 function ui(choices: string[] = [], instructions: string[] = []) {
@@ -221,4 +222,82 @@ test("judge cancellation and malformed assessments use the same failure path", a
     assert.equal(result.block, true);
     assert.match(failedUi.prompts[0], /Risk assessment failed/);
   }
+});
+
+test("the pipeline audits meaningful decisions but not Safe Bypasses", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "sentinel-events-"));
+  const events: AuditEvent[] = [];
+  const audit = async (event: AuditEvent) => { events.push(event); };
+  const assess = async (riskLevel: "low" | "medium" | "high") => ({
+    riskLevel,
+    operation: `${riskLevel} operation`,
+    riskExplanation: `${riskLevel} explanation`,
+  });
+
+  await approveToolCall({ toolName: "read", input: { path: "README.md" } }, { workspace, mode: "tui", ui: ui().value, audit });
+  assert.equal(events.length, 0);
+
+  for (const riskLevel of ["low", "medium"] as const) {
+    await approveToolCall(
+      { toolName: "custom_tool", input: { password: "hidden", value: riskLevel } },
+      { workspace, mode: "tui", ui: ui().value, audit, modelIdentifier: "provider/model", assess: () => assess(riskLevel) },
+    );
+  }
+  await approveToolCall(
+    { toolName: "custom_tool", input: { value: "high" } },
+    { workspace, mode: "tui", ui: ui(["Allow once"]).value, audit, assess: () => assess("high") },
+  );
+  await approveToolCall(
+    { toolName: "custom_tool", input: { value: "denied" } },
+    { workspace, mode: "tui", ui: ui(["Deny"]).value, audit, assess: () => assess("high") },
+  );
+  await approveToolCall(
+    { toolName: "bash", input: { command: "git reset --hard" } },
+    { workspace, mode: "tui", ui: ui(["Deny"]).value, audit },
+  );
+  await approveToolCall(
+    { toolName: "custom_tool", input: {} },
+    { workspace, mode: "tui", ui: ui(["Deny"]).value, audit, assess: async () => { throw new DOMException("timed out", "TimeoutError"); } },
+  );
+  await approveToolCall(
+    { toolName: "custom_tool", input: {} },
+    { workspace, mode: "tui", ui: ui(["Deny"]).value, audit, assess: async () => { throw new Error("provider failed"); } },
+  );
+
+  assert.deepEqual(events.map(({ decisionSource, outcome, riskLevel }) => ({ decisionSource, outcome, riskLevel })), [
+    { decisionSource: "ai-judge", outcome: "allowed", riskLevel: "low" },
+    { decisionSource: "ai-judge", outcome: "allowed", riskLevel: "medium" },
+    { decisionSource: "ai-judge", outcome: "approval-required", riskLevel: "high" },
+    { decisionSource: "human", outcome: "allowed", riskLevel: "high" },
+    { decisionSource: "ai-judge", outcome: "approval-required", riskLevel: "high" },
+    { decisionSource: "human", outcome: "denied", riskLevel: "high" },
+    { decisionSource: "hard-guard", outcome: "approval-required", riskLevel: "high" },
+    { decisionSource: "human", outcome: "denied", riskLevel: "high" },
+    { decisionSource: "ai-judge", outcome: "timeout", riskLevel: "high" },
+    { decisionSource: "human", outcome: "denied", riskLevel: "high" },
+    { decisionSource: "ai-judge", outcome: "judge-error", riskLevel: "high" },
+    { decisionSource: "human", outcome: "denied", riskLevel: "high" },
+  ]);
+  assert.equal(events[0].workingDirectory, await realpath(workspace));
+  assert.equal(events[0].modelIdentifier, "provider/model");
+  assert.equal(events[6].modelIdentifier, "unavailable");
+  assert.equal(typeof events[0].judgeLatencyMs, "number");
+  assert.deepEqual(events[0].arguments, { password: "hidden", value: "low" });
+});
+
+test("an audit failure never changes the Tool Call result", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "sentinel-audit-failure-"));
+  const failedUi = ui();
+  const result = await approveToolCall(
+    { toolName: "custom_tool", input: {} },
+    {
+      workspace,
+      mode: "tui",
+      ui: failedUi.value,
+      assess: async () => ({ riskLevel: "low", operation: "Read state", riskExplanation: "No state changes." }),
+      audit: async () => { throw new Error("disk full"); },
+    },
+  );
+  assert.deepEqual(result, {});
+  assert.match(failedUi.notifications[0], /audit/i);
 });

@@ -1,4 +1,5 @@
-import type { ExtensionAPI, ExtensionContext, ToolInfo } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, type ExtensionAPI, type ExtensionContext, type ToolInfo } from "@earendil-works/pi-coding-agent";
+import { writeAuditEvent } from "./audit.ts";
 import { assessWithPi } from "./judge.ts";
 import { approveToolCall } from "./pipeline.ts";
 
@@ -15,6 +16,8 @@ export default function sentinel(pi: ExtensionAPI): void {
         tool: toolContext(tool),
         userRequest: latestUserRequest(ctx),
         assess: (input, signal) => assessWithPi(input, signal, ctx),
+        audit: (auditEvent) => writeAuditEvent(auditEvent, getAgentDir()),
+        modelIdentifier: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined,
       },
     );
     return result.block ? result : undefined;
