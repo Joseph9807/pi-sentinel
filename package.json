@@ -2,7 +2,11 @@
   "name": "pi-sentinel",
   "version": "0.1.0",
   "description": "A deterministic safety gate for Pi tool calls",
+  "license": "MIT",
   "type": "module",
+  "os": [
+    "darwin"
+  ],
   "keywords": [
     "pi-package"
   ],
