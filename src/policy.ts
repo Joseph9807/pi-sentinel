@@ -11,11 +11,13 @@ export interface PolicyDecision {
   route: "safe-bypass" | "candidate" | "hard-guard";
   operation: string;
   riskExplanation: string;
+  remoteScript?: { url: string } | { inspectionUnavailable: string };
 }
 
 const READ_ONLY_TOOLS = new Set(["read", "grep", "find", "ls"]);
 const READ_ONLY_COMMANDS = new Set(["pwd", "ls", "cat", "head", "tail", "wc", "stat", "file", "which", "grep"]);
 const READ_ONLY_GIT = new Set(["status", "diff", "log", "show", "rev-parse"]);
+const SCRIPT_INTERPRETERS = new Set(["sh", "bash", "dash", "ash", "ksh", "zsh", "csh", "tcsh", "fish", "pwsh", "python", "perl", "ruby"]);
 const SYSTEM_ROOTS = new Set([
   "/",
   "/System",
@@ -100,12 +102,18 @@ export async function matchHardGuard(command: string, workspace: string): Promis
     return hard("Erase or repartition a disk", "This can irreversibly destroy disk data.");
   }
   const tokens = tokenize(command, true);
-  if (!tokens) return undefined;
+  if (!tokens) {
+    const remoteScript = detectRemoteScriptExecution(command, []);
+    return remoteScript
+      ? { ...hard("Download and execute a remote script", "Unreviewed remote code would run on this machine."), remoteScript }
+      : undefined;
+  }
   if (isDestructiveGit(tokens)) {
     return hard("Discard Git working data", "This can permanently discard uncommitted work.");
   }
-  if (isRemoteScriptExecution(tokens)) {
-    return hard("Download and execute a remote script", "Unreviewed remote code would run on this machine.");
+  const remoteScript = detectRemoteScriptExecution(command, tokens);
+  if (remoteScript) {
+    return { ...hard("Download and execute a remote script", "Unreviewed remote code would run on this machine."), remoteScript };
   }
   const home = await canonicalPath(homedir());
   for (let i = 0; i < tokens.length; i++) {
@@ -202,17 +210,29 @@ function isDestructiveGit(tokens: ShellToken[]): boolean {
   return false;
 }
 
-function isRemoteScriptExecution(tokens: ShellToken[]): boolean {
+function detectRemoteScriptExecution(command: string, tokens: ShellToken[]): PolicyDecision["remoteScript"] | undefined {
   for (let i = 0; i < tokens.length; i++) {
     if (tokens[i].value !== "|") continue;
     const left = segmentBefore(tokens, i);
     const right = segmentAfter(tokens, i);
     const downloader = left.findIndex((word) => ["curl", "wget"].includes(basename(word)));
-    if (downloader < 0 || !left.slice(downloader + 1).some((word) => /^https?:\/\//i.test(word))) continue;
-    const interpreter = right.find((word) => !["sudo", "env"].includes(basename(word)) && !/^[A-Za-z_]\w*=/.test(word));
-    if (interpreter && ["sh", "bash", "zsh", "python", "perl", "ruby"].includes(basename(interpreter))) return true;
+    if (downloader < 0) continue;
+    const prefix = left.slice(0, downloader);
+    const interpreter = right.findIndex((word) => SCRIPT_INTERPRETERS.has(basename(word)));
+    if (interpreter < 0) continue;
+    const directDownloader = prefix.every((word) => ["sudo", "env", "command"].includes(basename(word)) || /^[A-Za-z_]\w*=/.test(word));
+    const directInterpreter = right.slice(0, interpreter).every((word) => ["sudo", "env"].includes(basename(word)) || /^[A-Za-z_]\w*=/.test(word));
+    if (!directDownloader || !directInterpreter) {
+      return { inspectionUnavailable: "Inspection requires supported direct curl/wget-to-shell syntax with one literal HTTP(S) URL." };
+    }
+    const urls = left.slice(downloader + 1).filter((word) => /^https?:\/\//i.test(word) && !/[$`]/.test(word));
+    if (urls.length === 1) return { url: urls[0] };
+    return { inspectionUnavailable: "Inspection requires one direct literal HTTP(S) URL." };
   }
-  return false;
+  if (tokens.length === 0 && /\b(?:curl|wget)\b[\s\S]*\|\s*(?:(?:sudo|env)\s+)*(?:\S*\/)?(?:sh|bash|dash|ash|ksh|zsh|csh|tcsh|fish|pwsh|python|perl|ruby)\b/i.test(command)) {
+    return { inspectionUnavailable: "Inspection requires supported direct curl/wget-to-shell syntax with one literal HTTP(S) URL." };
+  }
+  return undefined;
 }
 
 function shellSegments(tokens: ShellToken[]): string[][] {

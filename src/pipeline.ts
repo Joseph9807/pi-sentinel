@@ -1,6 +1,8 @@
 import { canonicalPath, classifyToolCall, type PolicyDecision, type ToolCall } from "./policy.ts";
 import { type JudgeInput, type RiskAssessment, validateRiskAssessment } from "./judge.ts";
 import type { AuditEvent } from "./audit.ts";
+import type { RemoteScriptInspection } from "./remote-script.ts";
+import { withAbort } from "./abort.ts";
 
 export type { RiskAssessment, RiskLevel } from "./judge.ts";
 
@@ -22,6 +24,7 @@ export interface PipelineRuntime {
   modelIdentifier?: string;
   decisionCache?: Map<string, Promise<RiskAssessment>>;
   approvalQueue?: ApprovalQueue;
+  inspectRemoteScript?: (url: string, signal?: AbortSignal) => Promise<RemoteScriptInspection>;
 }
 
 export interface ApprovalQueue {
@@ -50,7 +53,32 @@ export async function approveToolCall(call: ToolCall, runtime: PipelineRuntime):
   let judgeLatencyMs: number | undefined;
   let judgeOutcome: AuditEvent["outcome"] | undefined;
   let judgeSource: AuditEvent["decisionSource"] = "ai-judge";
-  if (policy.route === "candidate" && runtime.assess) {
+  if (policy.remoteScript) {
+    const inspection = "url" in policy.remoteScript && runtime.inspectRemoteScript
+      ? await inspectRemoteScriptSafely(policy.remoteScript.url, runtime)
+      : { description: "Inspection unavailable.", unavailableReason: "inspectionUnavailable" in policy.remoteScript ? policy.remoteScript.inspectionUnavailable : "the inspection service is unavailable" };
+    if (inspection.preview !== undefined && runtime.assess) {
+      const started = performance.now();
+      try {
+        const preliminary = await assessCandidate(call, workingDirectory, runtime, {
+          preview: inspection.preview,
+          truncated: inspection.truncated ?? false,
+        });
+        assessment = {
+          riskLevel: "high",
+          operation: `Preliminary review: ${preliminary.operation}`,
+          riskExplanation: `Preliminary review only; Sentinel has not verified the script as safe. ${preliminary.riskExplanation} ${inspection.description}`,
+        };
+      } catch (error) {
+        if (runtime.signal?.aborted) throw runtime.signal.reason;
+        assessment.riskExplanation = "Preliminary inspection unavailable: AI review failed. Remote code remains unreviewed.";
+      } finally {
+        judgeLatencyMs = Math.round(performance.now() - started);
+      }
+    } else {
+      assessment.riskExplanation = `Preliminary inspection unavailable: ${inspection.unavailableReason ?? "AI review is unavailable"}. Remote code remains unreviewed.`;
+    }
+  } else if (policy.route === "candidate" && runtime.assess) {
     const key = decisionKey(call, workingDirectory);
     const cached = runtime.decisionCache?.get(key);
     let cachedAssessment: RiskAssessment | undefined;
@@ -125,28 +153,12 @@ async function audit(runtime: PipelineRuntime, event: AuditEvent): Promise<void>
   }
 }
 
-function withAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
-  return new Promise((resolve, reject) => {
-    const abort = () => reject(signal.reason);
-    if (signal.aborted) {
-      reject(signal.reason);
-      return;
-    }
-    signal.addEventListener("abort", abort, { once: true });
-    promise.then(
-      (value) => {
-        signal.removeEventListener("abort", abort);
-        resolve(value);
-      },
-      (error) => {
-        signal.removeEventListener("abort", abort);
-        reject(error);
-      },
-    );
-  });
-}
-
-async function assessCandidate(call: ToolCall, workingDirectory: string, runtime: PipelineRuntime): Promise<RiskAssessment> {
+async function assessCandidate(
+  call: ToolCall,
+  workingDirectory: string,
+  runtime: PipelineRuntime,
+  remoteScript?: JudgeInput["remoteScript"],
+): Promise<RiskAssessment> {
   const signal = runtime.signal
     ? AbortSignal.any([runtime.signal, AbortSignal.timeout(15_000)])
     : AbortSignal.timeout(15_000);
@@ -159,12 +171,22 @@ async function assessCandidate(call: ToolCall, workingDirectory: string, runtime
           tool: runtime.tool ?? { description: "No tool definition is available.", parameters: {} },
           workspace: workingDirectory,
           userRequest: runtime.userRequest ?? "No user request is available.",
+          ...(remoteScript ? { remoteScript } : {}),
         },
         signal,
       ),
       signal,
     ),
   );
+}
+
+async function inspectRemoteScriptSafely(url: string, runtime: PipelineRuntime): Promise<RemoteScriptInspection> {
+  try {
+    return await runtime.inspectRemoteScript!(url, runtime.signal);
+  } catch (error) {
+    if (runtime.signal?.aborted) throw runtime.signal.reason;
+    return { description: "Inspection unavailable: the download failed.", unavailableReason: error instanceof Error ? error.message : "the download failed" };
+  }
 }
 
 async function queueApproval<T>(queue: ApprovalQueue, signal: AbortSignal | undefined, action: () => Promise<T>): Promise<T> {

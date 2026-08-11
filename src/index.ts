@@ -2,6 +2,7 @@ import { getAgentDir, type ExtensionAPI, type ExtensionContext, type ToolInfo } 
 import { writeAuditEvent } from "./audit.ts";
 import { assessWithPi, type RiskAssessment } from "./judge.ts";
 import { approveToolCall, type ApprovalQueue } from "./pipeline.ts";
+import { inspectRemoteScript } from "./remote-script.ts";
 
 export default function sentinel(pi: ExtensionAPI): void {
   const decisionCache = new Map<string, Promise<RiskAssessment>>();
@@ -23,6 +24,7 @@ export default function sentinel(pi: ExtensionAPI): void {
         modelIdentifier: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined,
         decisionCache,
         approvalQueue,
+        inspectRemoteScript: (url, signal) => inspectRemoteScript(url, { signal }),
       },
     );
     return result.block ? result : undefined;
