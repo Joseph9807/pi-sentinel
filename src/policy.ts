@@ -203,7 +203,7 @@ function isDestructiveGit(tokens: ShellToken[]): boolean {
     const args = segment.slice(index);
     if (subcommand === "reset" && args.some((arg) => ["--hard", "--merge"].includes(arg))) return true;
     if (subcommand === "clean" && args.some((arg) => arg === "--force" || /^-[^-]*f/i.test(arg))) return true;
-    if (subcommand === "checkout" && args.some((arg) => ["--", "--force", "-f", "."].includes(arg))) return true;
+    if (subcommand === "checkout") return true;
     if (subcommand === "switch" && args.some((arg) => ["--discard-changes", "--force", "-f"].includes(arg))) return true;
     if (subcommand === "restore" && args.some((arg) => !arg.startsWith("-") || arg === "--worktree")) return true;
   }
