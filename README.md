@@ -52,7 +52,7 @@ Closing or cancelling the dialog denies the call. Approval dialogs are serialize
 
 ### Remote Scripts
 
-Direct literal HTTP(S) URLs used by `curl` or `wget` and piped to a shell remain Hard Guard operations. Sentinel may fetch a preview with Node's HTTP client to provide preliminary AI review context. It rejects localhost and non-public destinations, rechecks bounded redirects, accepts text content only, times out the request, and reads at most the first 64KB.
+Direct literal HTTP(S) URLs used by `curl` or `wget` and piped to a shell remain Hard Guard operations. Sentinel may fetch a preview with Node's HTTP client to provide preliminary AI Judge context. It rejects localhost and non-public destinations, rechecks bounded redirects, accepts text content only, times out the request, and reads at most the first 64KB.
 
 Remote-script review is preliminary. It is not static analysis, trust certification, or proof that a script is safe. Unsupported syntax, dynamic URLs, private destinations, download failures, and truncated previews still require Approval.
 
@@ -84,12 +84,12 @@ The active log is limited to 1MB and keeps two 1MB rotations (`.1` and `.2`), fo
 ## First-Release Limitations
 
 - macOS only; Linux, Windows, and cross-platform policy abstractions are out of scope.
-- AI approval is an ergonomic classifier, not a sandbox. Use OS-level isolation when a real security boundary is required.
+- The AI Judge is an ergonomic classifier, not a sandbox. Use OS-level isolation when a real security boundary is required.
 - Sentinel does not protect against a malicious local user, a compromised Pi process, or code already running with the user's permissions.
 - Sensitive-read protection, secret-exfiltration prevention, prompt-injection detection, dependency malware detection, and general supply-chain security are out of scope.
 - Direct user `!` and `!!` shell commands are not intercepted; Sentinel observes model-issued Tool Calls only.
 - Remote-script inspection supports only one direct literal public HTTP(S) URL passed from `curl` or `wget` to a shell. Other download-then-execute flows are not inspected.
-- Remote scripts are never automatically approved, even when preliminary AI review appears safe.
+- Remote scripts are never automatically approved, even when preliminary AI Judge review appears safe.
 - Audit redaction recognizes common sensitive key names only. Sensitive values under other keys may appear in the bounded preview.
 - There are no user-defined rules, thresholds, protected paths, model choices, log settings, allowlists, or denylists.
 - There are no persistent or per-project approvals, cross-session caches, policy editor, configuration file, management command, status screen, log viewer, or custom settings UI.

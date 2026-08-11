@@ -42,6 +42,7 @@ test("Hard Guards cover catastrophic command families", async () => {
     "git clean -fdx",
     "git -C repo reset --hard",
     "git checkout -f main",
+    "git checkout .",
     "git switch --discard-changes main",
     "git reset --merge HEAD~1",
     "git reset --hard \"$TARGET\"",
