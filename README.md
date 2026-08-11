@@ -2,6 +2,12 @@
 
 `pi-sentinel` is a macOS safety gate for model-issued [Pi](https://github.com/earendil-works/pi) Tool Calls. It keeps routine coding uninterrupted while requiring human Approval for operations that may cause serious damage or data loss.
 
+## Why
+
+Pi users often run coding agents with minimal or no manual approval because frequent permission prompts interrupt development. This leaves the user's macOS system and data exposed to accidental destructive operations caused by model mistakes, malformed commands, or an unexpectedly broad tool call.
+
+Existing approval approaches tend to present raw commands without explaining what they do, treat too many operations as equally dangerous, or require a decision for every match. Users therefore face a poor choice between constant interruptions and unrestricted execution.
+
 It is not a sandbox or a complete security boundary.
 
 ## Requirements
